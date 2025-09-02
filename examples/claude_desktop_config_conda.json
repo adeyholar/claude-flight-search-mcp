@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "flight-search": {
+      "command": "D:\\ai\\conda\\envs\\claude-flight-mcp-3.11\\python.exe",
+      "args": [
+        "D:\\AI\\Gits\\claude-flight-search-mcp\\src\\flight_search_server.py"
+      ],
+      "cwd": "D:\\AI\\Gits\\claude-flight-search-mcp",
+      "env": {
+        "PYTHONPATH": "D:\\AI\\Gits\\claude-flight-search-mcp\\src"
+      }
+    }
+  }
+}
