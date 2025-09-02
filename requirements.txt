@@ -1,24 +1,24 @@
 # MCP Server Dependencies
-mcp>=1.0.0
+mcp
 
 # HTTP Client for API calls
-httpx>=0.24.0
+httpx
 
 # Environment variable management
-python-dotenv>=1.0.0
+python-dotenv
 
 # Date/time handling
-python-dateutil>=2.8.0
+python-dateutil
 
 # JSON schema validation
-jsonschema>=4.0.0
+jsonschema
 
 # Development Dependencies
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
-black>=23.0.0
-flake8>=6.0.0
-mypy>=1.0.0
+pytest
+pytest-asyncio
+black
+flake8
+mypy
 
 # Optional: For real flight APIs
-# amadeus>=8.0.0  # Uncomment when ready to use Amadeus API
+# amadeus  # Uncomment when ready to use Amadeus API
