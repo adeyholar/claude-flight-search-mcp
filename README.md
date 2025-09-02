@@ -17,9 +17,15 @@ A Model Context Protocol (MCP) server that provides flight search capabilities f
 ```bash
 git clone <your-repo-url>
 cd claude-flight-search-mcp
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+
+# Create and activate conda environment
+conda env create -f environment.yml
+conda activate claude-flight-mcp
+
+# Alternative: Create environment manually
+# conda create -n claude-flight-mcp python=3.11 -y
+# conda activate claude-flight-mcp
+# pip install -r requirements.txt
 ```
 
 ### 2. Environment Configuration

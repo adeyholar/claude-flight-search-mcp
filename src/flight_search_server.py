@@ -12,15 +12,21 @@ import os
 import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
+import sqlite3
 
 # Basic error handling for missing dependencies
 try:
     from mcp.server import Server
     from mcp.types import Tool, TextContent
+    import httpx
+    from dotenv import load_dotenv
 except ImportError as e:
-    print(f"Error importing MCP: {e}", file=sys.stderr)
-    print("Please install MCP with: pip install mcp", file=sys.stderr)
+    print(f"Error importing dependencies: {e}", file=sys.stderr)
+    print("Please install with: pip install mcp httpx python-dotenv", file=sys.stderr)
     sys.exit(1)
+
+# Load environment variables
+load_dotenv()
 
 # Initialize MCP Server
 app = Server("flight-search")
@@ -153,7 +159,395 @@ class FlightSearchService:
     """Service class to handle flight search operations"""
     
     def __init__(self):
-        print("Flight Search Service initialized", file=sys.stderr)
+        self.amadeus_client_id = os.getenv('AMADEUS_CLIENT_ID')
+        self.amadeus_client_secret = os.getenv('AMADEUS_CLIENT_SECRET')
+        self.use_real_api = os.getenv('USE_REAL_API', 'false').lower() == 'true'
+        self.fallback_to_mock = os.getenv('API_FALLBACK_TO_MOCK', 'true').lower() == 'true'
+        self.access_token = None
+        self.token_expires_at = None
+        
+        # Initialize cache database
+        self.init_cache_db()
+        
+        print(f"Flight Search Service initialized - Real API: {self.use_real_api}", file=sys.stderr)
+        
+    def init_cache_db(self):
+        """Initialize SQLite cache database"""
+        try:
+            self.cache_db = sqlite3.connect('flight_cache.db', check_same_thread=False)
+            cursor = self.cache_db.cursor()
+            
+            # Create cache tables
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS api_tokens (
+                    id INTEGER PRIMARY KEY,
+                    access_token TEXT,
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS flight_searches (
+                    id INTEGER PRIMARY KEY,
+                    search_key TEXT UNIQUE,
+                    origin TEXT,
+                    destination TEXT,
+                    departure_date TEXT,
+                    passengers INTEGER,
+                    results JSON,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS price_tracking (
+                    id INTEGER PRIMARY KEY,
+                    route TEXT,
+                    date TEXT,
+                    lowest_price REAL,
+                    airline TEXT,
+                    flight_number TEXT,
+                    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            self.cache_db.commit()
+            print("Cache database initialized", file=sys.stderr)
+            
+        except Exception as e:
+            print(f"Error initializing cache: {e}", file=sys.stderr)
+            self.cache_db = None
+    
+    async def get_amadeus_token(self) -> Optional[str]:
+        """Get or refresh Amadeus API access token"""
+        
+        # Check if we have a valid cached token
+        if (self.access_token and self.token_expires_at and 
+            datetime.now() < self.token_expires_at):
+            return self.access_token
+            
+        if not self.amadeus_client_id or not self.amadeus_client_secret:
+            print("Amadeus API credentials not found", file=sys.stderr)
+            return None
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    'https://api.amadeus.com/v1/security/oauth2/token',
+                    data={
+                        'grant_type': 'client_credentials',
+                        'client_id': self.amadeus_client_id,
+                        'client_secret': self.amadeus_client_secret
+                    },
+                    timeout=10.0
+                )
+                
+                if response.status_code != 200:
+                    print(f"Failed to get Amadeus token: {response.status_code} - {response.text}", file=sys.stderr)
+                    return None
+                    
+                token_data = response.json()
+                self.access_token = token_data['access_token']
+                expires_in = token_data.get('expires_in', 3600)
+                self.token_expires_at = datetime.now() + timedelta(seconds=expires_in - 60)
+                
+                print("Successfully obtained Amadeus access token", file=sys.stderr)
+                return self.access_token
+                
+        except Exception as e:
+            print(f"Error getting Amadeus token: {e}", file=sys.stderr)
+            return None
+    
+    async def search_flights_amadeus(self, origin: str, destination: str, 
+                                   departure_date: str, passengers: int = 1) -> Optional[Dict[str, Any]]:
+        """Search flights using Amadeus API"""
+        
+        token = await self.get_amadeus_token()
+        if not token:
+            return None
+            
+        try:
+            headers = {'Authorization': f'Bearer {token}'}
+            params = {
+                'originLocationCode': origin,
+                'destinationLocationCode': destination,
+                'departureDate': departure_date,
+                'adults': passengers,
+                'max': 10,
+                'currencyCode': 'USD'
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    'https://api.amadeus.com/v2/shopping/flight-offers',
+                    headers=headers,
+                    params=params,
+                    timeout=15.0
+                )
+                
+                if response.status_code != 200:
+                    print(f"Amadeus API error: {response.status_code} - {response.text}", file=sys.stderr)
+                    return None
+                
+                data = response.json()
+                print(f"Amadeus API returned {len(data.get('data', []))} flight offers", file=sys.stderr)
+                
+                return self._parse_amadeus_response(data, origin, destination, departure_date, passengers)
+                
+        except Exception as e:
+            print(f"Error calling Amadeus API: {e}", file=sys.stderr)
+            return None
+    
+    def _parse_amadeus_response(self, amadeus_data: Dict, origin: str, destination: str, 
+                               departure_date: str, passengers: int) -> Dict[str, Any]:
+        """Parse Amadeus API response into our standard format"""
+        
+        flights = []
+        
+        for i, offer in enumerate(amadeus_data.get('data', [])[:5]):  # Limit to 5 flights
+            try:
+                itinerary = offer['itineraries'][0]  # First itinerary (outbound)
+                segments = itinerary['segments']
+                first_segment = segments[0]
+                last_segment = segments[-1]
+                
+                # Calculate total duration
+                duration_iso = itinerary['duration']
+                duration_hours = self._parse_duration(duration_iso)
+                
+                # Determine stops
+                stops = len(segments) - 1
+                stop_airports = [seg['arrival']['iataCode'] for seg in segments[:-1]]
+                
+                # Get pricing
+                price_data = offer['price']
+                total_price = float(price_data['total'])
+                
+                # Get airline info
+                carrier_code = first_segment['carrierCode']
+                flight_number = f"{carrier_code}{first_segment['number']}"
+                
+                flight = {
+                    "id": f"AMADEUS_{i+1}",
+                    "airline": {
+                        "code": carrier_code,
+                        "name": self._get_airline_name(carrier_code)
+                    },
+                    "flight_number": flight_number,
+                    "aircraft": first_segment.get('aircraft', {}).get('code', 'Unknown'),
+                    "departure": {
+                        "airport": first_segment['departure']['iataCode'],
+                        "time": first_segment['departure']['at'][-8:-3],  # Extract time
+                        "date": departure_date,
+                        "terminal": first_segment['departure'].get('terminal', 'TBD')
+                    },
+                    "arrival": {
+                        "airport": last_segment['arrival']['iataCode'],
+                        "time": last_segment['arrival']['at'][-8:-3],  # Extract time
+                        "date": departure_date,
+                        "terminal": last_segment['arrival'].get('terminal', 'TBD')
+                    },
+                    "duration": duration_hours,
+                    "stops": stops,
+                    "stop_airports": stop_airports,
+                    "price": {
+                        "total": total_price,
+                        "currency": price_data['currency'],
+                        "base_fare": float(price_data.get('base', total_price * 0.85)),
+                        "taxes": float(price_data.get('total', total_price)) - float(price_data.get('base', total_price * 0.85))
+                    },
+                    "cabin_class": offer.get('travelerPricings', [{}])[0].get('fareDetailsBySegment', [{}])[0].get('cabin', 'ECONOMY'),
+                    "booking_class": offer.get('travelerPricings', [{}])[0].get('fareDetailsBySegment', [{}])[0].get('class', 'Y'),
+                    "seats_available": offer.get('numberOfBookableSeats', 9)
+                }
+                
+                flights.append(flight)
+                
+            except Exception as e:
+                print(f"Error parsing flight offer {i}: {e}", file=sys.stderr)
+                continue
+        
+        return {
+            "search_params": {
+                "origin": origin,
+                "destination": destination,
+                "departure_date": departure_date,
+                "passengers": passengers
+            },
+            "flights": flights,
+            "search_timestamp": datetime.now().isoformat(),
+            "total_results": len(flights),
+            "data_source": "amadeus_api"
+        }
+    
+    def _parse_duration(self, duration_iso: str) -> str:
+        """Parse ISO 8601 duration to human readable format"""
+        try:
+            # Remove 'PT' prefix and parse
+            duration = duration_iso.replace('PT', '')
+            hours = 0
+            minutes = 0
+            
+            if 'H' in duration:
+                hours = int(duration.split('H')[0])
+                duration = duration.split('H')[1] if 'H' in duration else duration
+            
+            if 'M' in duration:
+                minutes = int(duration.replace('M', ''))
+            
+            return f"{hours}h {minutes}m"
+            
+        except:
+            return duration_iso
+    
+    def _get_airline_name(self, code: str) -> str:
+        """Get airline name from IATA code"""
+        airline_names = {
+            'AA': 'American Airlines',
+            'DL': 'Delta Air Lines', 
+            'UA': 'United Airlines',
+            'WN': 'Southwest Airlines',
+            'B6': 'JetBlue Airways',
+            'AS': 'Alaska Airlines',
+            'NK': 'Spirit Airlines',
+            'F9': 'Frontier Airlines',
+            'G4': 'Allegiant Air',
+            'SY': 'Sun Country Airlines',
+            'BA': 'British Airways',
+            'LH': 'Lufthansa',
+            'AF': 'Air France',
+            'KL': 'KLM',
+            'TK': 'Turkish Airlines',
+            'EK': 'Emirates',
+            'QR': 'Qatar Airways',
+            'SQ': 'Singapore Airlines',
+            'CX': 'Cathay Pacific',
+            'JL': 'Japan Airlines',
+            'NH': 'ANA',
+            'AC': 'Air Canada',
+            'LX': 'Swiss International Air Lines',
+            'OS': 'Austrian Airlines',
+            'SK': 'SAS Scandinavian Airlines',
+            'AZ': 'Alitalia',
+            'IB': 'Iberia',
+            'TP': 'TAP Air Portugal',
+            'AT': 'Royal Air Maroc',
+            'MS': 'EgyptAir',
+            'ET': 'Ethiopian Airlines',
+            'KQ': 'Kenya Airways',
+            'SA': 'South African Airways'
+        }
+        return airline_names.get(code, f"Airline {code}")
+    
+    async def search_flights(self, origin: str, destination: str, departure_date: str,
+                           return_date: Optional[str] = None, passengers: int = 1) -> Dict[str, Any]:
+        """Main flight search method - tries real API first, falls back to mock"""
+        
+        # Check cache first
+        cache_key = f"{origin}_{destination}_{departure_date}_{passengers}"
+        cached_result = self._get_cached_search(cache_key)
+        
+        if cached_result:
+            print("Returning cached flight search result", file=sys.stderr)
+            return cached_result
+        
+        # Try real API if enabled and configured
+        if self.use_real_api and self.amadeus_client_id:
+            print("Attempting Amadeus API search", file=sys.stderr)
+            result = await self.search_flights_amadeus(origin, destination, departure_date, passengers)
+            
+            if result and result.get('flights'):
+                print(f"Amadeus API returned {len(result['flights'])} flights", file=sys.stderr)
+                self._cache_search_result(cache_key, result)
+                self._track_prices(result)
+                return result
+            else:
+                print("Amadeus API failed or returned no results", file=sys.stderr)
+        
+        # Fallback to mock data
+        if self.fallback_to_mock:
+            print("Using mock data", file=sys.stderr)
+            result = await self.search_flights_mock(origin, destination, departure_date, return_date, passengers)
+            result['data_source'] = 'mock_data'
+            return result
+        else:
+            # Return empty result if no fallback
+            return {
+                "search_params": {
+                    "origin": origin,
+                    "destination": destination,
+                    "departure_date": departure_date,
+                    "passengers": passengers
+                },
+                "flights": [],
+                "search_timestamp": datetime.now().isoformat(),
+                "total_results": 0,
+                "data_source": "no_data",
+                "error": "No flight data available"
+            }
+    
+    def _get_cached_search(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Get cached search result if still valid"""
+        if not self.cache_db:
+            return None
+            
+        try:
+            cursor = self.cache_db.cursor()
+            cursor.execute(
+                "SELECT results FROM flight_searches WHERE search_key = ? AND created_at > datetime('now', '-1 hour')",
+                (cache_key,)
+            )
+            result = cursor.fetchone()
+            
+            if result:
+                return json.loads(result[0])
+                
+        except Exception as e:
+            print(f"Error reading cache: {e}", file=sys.stderr)
+            
+        return None
+    
+    def _cache_search_result(self, cache_key: str, result: Dict[str, Any]):
+        """Cache search result"""
+        if not self.cache_db:
+            return
+            
+        try:
+            cursor = self.cache_db.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO flight_searches (search_key, origin, destination, departure_date, passengers, results) VALUES (?, ?, ?, ?, ?, ?)",
+                (cache_key, result['search_params']['origin'], result['search_params']['destination'], 
+                 result['search_params']['departure_date'], result['search_params']['passengers'], 
+                 json.dumps(result))
+            )
+            self.cache_db.commit()
+            
+        except Exception as e:
+            print(f"Error caching result: {e}", file=sys.stderr)
+    
+    def _track_prices(self, result: Dict[str, Any]):
+        """Track lowest prices for price monitoring"""
+        if not self.cache_db or not result.get('flights'):
+            return
+            
+        try:
+            # Find lowest price flight
+            lowest_flight = min(result['flights'], key=lambda x: x['price']['total'])
+            
+            route = f"{result['search_params']['origin']}-{result['search_params']['destination']}"
+            date = result['search_params']['departure_date']
+            
+            cursor = self.cache_db.cursor()
+            cursor.execute(
+                "INSERT INTO price_tracking (route, date, lowest_price, airline, flight_number) VALUES (?, ?, ?, ?, ?)",
+                (route, date, lowest_flight['price']['total'], 
+                 lowest_flight['airline']['name'], lowest_flight['flight_number'])
+            )
+            self.cache_db.commit()
+            
+        except Exception as e:
+            print(f"Error tracking prices: {e}", file=sys.stderr)
         
     async def search_flights_mock(self, origin: str, destination: str, 
                                  departure_date: str, return_date: Optional[str] = None,
@@ -543,6 +937,31 @@ async def list_tools() -> List[Tool]:
                 },
                 "required": ["origin", "destination", "start_date", "end_date"]
             }
+        ),
+        Tool(
+            name="get_price_history",
+            description="Get price tracking history for a route",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "origin": {
+                        "type": "string",
+                        "description": "Origin airport code"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Destination airport code"
+                    },
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days back to look (default: 30)",
+                        "default": 30,
+                        "minimum": 1,
+                        "maximum": 90
+                    }
+                },
+                "required": ["origin", "destination"]
+            }
         )
     ]
 
@@ -560,6 +979,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return await compare_flight_prices(**arguments)
         elif name == "find_best_price":
             return await find_best_price(**arguments)
+        elif name == "get_price_history":
+            return await get_price_history(**arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
     except Exception as e:
@@ -584,22 +1005,49 @@ async def search_flights(origin: str, destination: str, departure_date: str,
             text=f"Airport code not found. Available airports in our database: {available_airports}\n\nNote: This is a demo with limited airports. In a real implementation, all airports would be supported."
         )]
     
-    # Use mock data for now
-    result = await flight_service.search_flights_mock(
+    # Use the enhanced search service
+    result = await flight_service.search_flights(
         origin, destination, departure_date, return_date, passengers
     )
     
+    if result.get('error'):
+        return [TextContent(
+            type="text",
+            text=f"Error searching flights: {result['error']}"
+        )]
+    
+    if not result.get('flights'):
+        return [TextContent(
+            type="text",
+            text=f"No flights found for {origin} → {destination} on {departure_date}"
+        )]
+    
     # Format the response nicely
-    response_text = f"🛫 Flight Search Results\n"
+    data_source = result.get('data_source', 'unknown')
+    source_emoji = "🔴" if data_source == "amadeus_api" else "🟡"
+    source_text = "Live Amadeus API" if data_source == "amadeus_api" else "Demo Data"
+    
+    response_text = f"🛫 Flight Search Results ({source_emoji} {source_text})\n"
     response_text += f"Route: {origin} → {destination}\n"
     response_text += f"Date: {departure_date}\n"
     response_text += f"Passengers: {passengers}\n\n"
     
     for i, flight in enumerate(result['flights'], 1):
         response_text += f"✈️ Option {i}: {flight['airline']['name']} {flight['flight_number']}\n"
-        response_text += f"   Aircraft: {flight['aircraft']}\n"
-        response_text += f"   Departure: {flight['departure']['time']} from {flight['departure']['airport']} Terminal {flight['departure']['terminal']}\n"
-        response_text += f"   Arrival: {flight['arrival']['time']} at {flight['arrival']['airport']} Terminal {flight['arrival']['terminal']}\n"
+        
+        if flight.get('aircraft'):
+            response_text += f"   Aircraft: {flight['aircraft']}\n"
+            
+        response_text += f"   Departure: {flight['departure']['time']} from {flight['departure']['airport']}"
+        if flight['departure'].get('terminal') and flight['departure']['terminal'] != 'TBD':
+            response_text += f" Terminal {flight['departure']['terminal']}"
+        response_text += "\n"
+        
+        response_text += f"   Arrival: {flight['arrival']['time']} at {flight['arrival']['airport']}"
+        if flight['arrival'].get('terminal') and flight['arrival']['terminal'] != 'TBD':
+            response_text += f" Terminal {flight['arrival']['terminal']}"
+        response_text += "\n"
+        
         response_text += f"   Duration: {flight['duration']}\n"
         
         if flight['stops'] == 0:
@@ -609,14 +1057,115 @@ async def search_flights(origin: str, destination: str, departure_date: str,
             response_text += f"   🔄 {flight['stops']} stop(s): {stops_text}\n"
             
         response_text += f"   💰 Price: ${flight['price']['total']:.2f} {flight['price']['currency']}\n"
-        response_text += f"   💺 Seats available: {flight['seats_available']}\n"
-        response_text += f"   📋 Class: {flight['cabin_class']} ({flight['booking_class']})\n\n"
+        
+        if flight.get('seats_available'):
+            response_text += f"   💺 Seats available: {flight['seats_available']}\n"
+            
+        if flight.get('cabin_class'):
+            response_text += f"   📋 Class: {flight['cabin_class']}"
+            if flight.get('booking_class'):
+                response_text += f" ({flight['booking_class']})"
+            response_text += "\n"
+        
+        response_text += "\n"
     
     response_text += f"🕒 Search completed at: {result['search_timestamp']}\n"
     response_text += f"📊 Total results: {result['total_results']}\n\n"
-    response_text += "💡 This is demo data. In a real implementation, this would connect to live flight APIs."
+    
+    if data_source == "amadeus_api":
+        response_text += "✅ This data is from live Amadeus API with real pricing and availability."
+    elif data_source == "mock_data":
+        response_text += "⚠️ This is demo data. Real API was not available or failed."
     
     return [TextContent(type="text", text=response_text)]
+
+async def get_price_history(origin: str, destination: str, days_back: int = 30) -> List[TextContent]:
+    """Get price tracking history for a route"""
+    
+    origin = origin.upper()
+    destination = destination.upper()
+    
+    if origin not in AIRPORT_DATABASE or destination not in AIRPORT_DATABASE:
+        available_airports = ', '.join(AIRPORT_DATABASE.keys())
+        return [TextContent(
+            type="text",
+            text=f"Airport code not found. Available airports: {available_airports}"
+        )]
+    
+    if not flight_service.cache_db:
+        return [TextContent(
+            type="text",
+            text="Price tracking database not available."
+        )]
+    
+    try:
+        cursor = flight_service.cache_db.cursor()
+        route = f"{origin}-{destination}"
+        
+        cursor.execute('''
+            SELECT date, lowest_price, airline, flight_number, recorded_at 
+            FROM price_tracking 
+            WHERE route = ? AND recorded_at > datetime('now', '-{} days')
+            ORDER BY recorded_at DESC
+        '''.format(days_back), (route,))
+        
+        results = cursor.fetchall()
+        
+        if not results:
+            return [TextContent(
+                type="text",
+                text=f"No price history found for {origin} → {destination} in the last {days_back} days.\n\nTip: Perform some flight searches first to build up price tracking data."
+            )]
+        
+        response_text = f"📈 Price History: {origin} → {destination}\n"
+        response_text += f"📅 Last {days_back} days ({len(results)} data points)\n\n"
+        
+        # Calculate statistics
+        prices = [float(row[1]) for row in results]
+        min_price = min(prices)
+        max_price = max(prices)
+        avg_price = sum(prices) / len(prices)
+        
+        response_text += f"📊 STATISTICS:\n"
+        response_text += f"💰 Lowest: ${min_price:.2f}\n"
+        response_text += f"💸 Highest: ${max_price:.2f}\n"
+        response_text += f"📊 Average: ${avg_price:.2f}\n\n"
+        
+        response_text += f"📋 RECENT SEARCHES:\n"
+        
+        for i, (date, price, airline, flight_num, recorded_at) in enumerate(results[:10]):
+            recorded_date = recorded_at.split('T')[0] if 'T' in recorded_at else recorded_at.split(' ')[0]
+            
+            if float(price) == min_price:
+                response_text += f"🏆 {date}: ${float(price):.2f} - {airline} {flight_num} (Best Price!)\n"
+            else:
+                response_text += f"   {date}: ${float(price):.2f} - {airline} {flight_num}\n"
+        
+        if len(results) > 10:
+            response_text += f"   ... and {len(results) - 10} more entries\n"
+        
+        # Price trend analysis
+        if len(results) >= 3:
+            recent_avg = sum(prices[:3]) / 3
+            older_avg = sum(prices[-3:]) / 3
+            
+            response_text += f"\n📈 TREND ANALYSIS:\n"
+            if recent_avg < older_avg * 0.95:
+                response_text += f"📉 Prices trending DOWN (recent avg: ${recent_avg:.2f})\n"
+            elif recent_avg > older_avg * 1.05:
+                response_text += f"📈 Prices trending UP (recent avg: ${recent_avg:.2f})\n"
+            else:
+                response_text += f"➡️ Prices relatively STABLE (recent avg: ${recent_avg:.2f})\n"
+        
+        response_text += f"\n💡 This data comes from your actual flight searches using the MCP server."
+        
+        return [TextContent(type="text", text=response_text)]
+        
+    except Exception as e:
+        return [TextContent(
+            type="text",
+            text=f"Error retrieving price history: {str(e)}"
+        )]
 
 async def find_best_price(origin: str, destination: str, start_date: str, 
                          end_date: str, passengers: int = 1) -> List[TextContent]:
@@ -665,18 +1214,19 @@ async def find_best_price(origin: str, destination: str, start_date: str,
     while current_date <= end_dt:
         date_str = current_date.strftime("%Y-%m-%d")
         
-        # Get flights for this date
-        result = await flight_service.search_flights_mock(
+        # Get flights for this date using the enhanced search service
+        result = await flight_service.search_flights(
             origin, destination, date_str, None, passengers
         )
         
         # Find cheapest flight for this date
-        if result['flights']:
+        if result.get('flights'):
             cheapest_flight = min(result['flights'], key=lambda x: x['price']['total'])
             search_results.append({
                 'date': date_str,
                 'price': cheapest_flight['price']['total'],
-                'flight': cheapest_flight
+                'flight': cheapest_flight,
+                'data_source': result.get('data_source', 'unknown')
             })
             
             if cheapest_flight['price']['total'] < best_price:
@@ -685,6 +1235,9 @@ async def find_best_price(origin: str, destination: str, start_date: str,
                 best_flight = cheapest_flight
         
         current_date += timedelta(days=1)
+        
+        # Add small delay to respect API limits
+        await asyncio.sleep(0.1)
     
     if not best_flight:
         return [TextContent(
