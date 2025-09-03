@@ -198,7 +198,8 @@ async def test_amadeus_api():
         # Test token request
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                'https://api.amadeus.com/v1/security/oauth2/token',
+                'https://test.api.amadeus.com/v1/security/oauth2/token',
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
                 data={
                     'grant_type': 'client_credentials',
                     'client_id': client_id,

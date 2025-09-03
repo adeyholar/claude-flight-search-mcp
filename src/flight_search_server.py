@@ -61,10 +61,6 @@ class FlightSearchService:
         self.init_cache_db()
         print(f"Flight Search Service initialized - Real API: {self.use_real_api}", file=sys.stderr)
         
-        # Test API connection on startup if enabled
-        if self.use_real_api and self.amadeus_client_id:
-            asyncio.create_task(self.test_api_connection())
-        
     async def test_api_connection(self):
         """Test API connection on startup"""
         try:
